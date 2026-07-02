@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: rede-relay
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: SCRIBE_PUB_TOKEN
+        sync: false   # Renderのダッシュボードで手入力する(secretsに含めない)

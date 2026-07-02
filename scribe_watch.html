@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>scribe — live</title>
+<style>
+  /* scribe_index.htmlと同じ見た目の変数・タイポグラフィを使う(読み取り専用) */
+  :root {
+    --bg: #1a1a1a;
+    --text: #e8e6e0;
+    --text-dim: #6b6b6b;
+    --accent: #8a8a8a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    height: 100%;
+    overflow: hidden;
+  }
+  body {
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }
+
+  #status {
+    position: fixed;
+    top: 14px;
+    right: 18px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    user-select: none;
+    z-index: 10;
+  }
+  #status.live { color: #d96b6b; }
+
+  /* RECインジケータ。ライブ中は赤い●がゆっくり明滅し続け、
+     書き手が不在(body.away)のときはグレーの停止ボタン(■)になって静止する */
+  #status .dot,
+  #jump .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #d96b6b;
+    animation: rec-breathe 2.2s ease-in-out infinite;
+  }
+  body.away #status .dot,
+  body.away #jump .dot {
+    border-radius: 1.5px;
+    background: var(--text-dim);
+    animation: none;
+  }
+  @keyframes rec-breathe {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+
+  /* 不在中は執筆点のキャレットも消す(書く身体がそこにいないため) */
+  body.away #live-caret {
+    display: none;
+  }
+
+  #view-wrap {
+    height: 100%;
+    overflow-y: auto;
+    padding: 64px 0 40vh 0;
+    display: flex;
+    justify-content: center;
+  }
+
+  #view {
+    width: 100%;
+    max-width: 720px;
+    min-height: 40vh;
+    padding: 0 28px;
+    font-size: 18px;
+    line-height: 1.9;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .embed-image {
+    display: block;
+    max-width: 100%;
+    border-radius: 6px;
+    margin: 14px 0;
+  }
+  .embed-pdf {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    margin: 10px 0;
+    background: rgba(255,255,255,0.04);
+    border-radius: 8px;
+    color: var(--text);
+    text-decoration: none;
+    width: fit-content;
+    font-size: 14px;
+  }
+  .embed-podcast {
+    display: block;
+    margin: 14px 0;
+    border-radius: 10px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.03);
+  }
+  .embed-podcast iframe {
+    display: block;
+    border: none;
+    width: 100%;
+  }
+  a.plain-link {
+    color: #7fb0e0;
+    text-decoration: underline;
+    word-break: break-all;
+  }
+
+  /* 執筆点(文末)の明滅キャレット: 「今まさに書かれている」ことを示す */
+  #live-caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.15em;
+    background: var(--text);
+    vertical-align: text-bottom;
+    margin-left: 1px;
+    animation: caret-blink 1.1s steps(1) infinite;
+  }
+  @keyframes caret-blink {
+    50% { opacity: 0; }
+  }
+
+  /* 上へスクロールして読み返している人に「下で執筆が続いている」ことを
+     知らせるフローティングチップ。クリックで執筆点へ戻る */
+  #jump {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%) translateY(8px);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 16px;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    color: var(--text);
+    background: rgba(30,30,30,0.92);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 999px;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s, transform 0.25s;
+    user-select: none;
+    z-index: 10;
+  }
+  #jump.visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+  }
+  #jump.pulse .dot {
+    /* 打鍵パルス(transform)と明滅(opacity)は別プロパティなので併走できる */
+    animation: dot-pulse 0.5s ease, rec-breathe 2.2s ease-in-out infinite;
+  }
+  @keyframes dot-pulse {
+    40% { transform: scale(1.9); }
+  }
+</style>
+</head>
+<body>
+
+<div id="status">接続中…</div>
+<div id="view-wrap">
+  <div id="view"></div>
+</div>
+<div id="jump"><span class="dot"></span><span id="jump-label">いま書いています ▼</span></div>
+
+<script>
+const view = document.getElementById('view');
+const wrap = document.getElementById('view-wrap');
+const statusEl = document.getElementById('status');
+const jumpChip = document.getElementById('jump');
+const jumpLabel = document.getElementById('jump-label');
+
+// 執筆点に置く明滅キャレット。innerHTMLを差し替えるたびに末尾へ付け直す
+const caret = document.createElement('span');
+caret.id = 'live-caret';
+
+// 書き手側のページリロードでseqが振り直されるため、sessionが変わったらリセットする
+let lastSession = null;
+let lastSeq = 0;
+
+// ---- 受信HTMLのサニタイズ ----
+// 中継は認証済みのscribeしかpubできないが、万一書き込み口が破られた場合に
+// このページが攻撃の配布点になるのを防ぐ保険。ホワイトリスト方式:
+// scribeが実際に生成するタグ(div/br/img/a/iframe)だけを許可し、
+// 属性はこちらで組み立て直す。それ以外のタグは剥がしてテキストだけ残す。
+const ALLOWED_IFRAME_HOSTS = [
+  'open.spotify.com',
+  'embed.podcasts.apple.com',
+  'www.youtube.com',
+];
+
+function sanitizeInto(target, html) {
+  // DOMParserの生成するドキュメントは不活性(スクリプト実行・リソース読込なし)
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  target.replaceChildren(...sanitizeChildren(doc.body));
+}
+
+function sanitizeChildren(node) {
+  const out = [];
+  for (const child of node.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      out.push(document.createTextNode(child.textContent));
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    const tag = child.tagName;
+
+    if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEMPLATE') continue; // 中身ごと捨てる
+
+    if (tag === 'BR') {
+      out.push(document.createElement('br'));
+      continue;
+    }
+    if (tag === 'IMG') {
+      const src = child.getAttribute('src') || '';
+      if (/^(https?:\/\/|\/|images\/)/i.test(src)) {
+        const img = document.createElement('img');
+        img.src = src;
+        img.className = 'embed-image';
+        out.push(img);
+      }
+      continue;
+    }
+    if (tag === 'A') {
+      const href = child.getAttribute('href') || '';
+      if (/^(https?:|mailto:|\/|images\/)/i.test(href)) {
+        const a = document.createElement('a');
+        a.href = href;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.className = /\bembed-pdf\b/.test(child.className) ? 'embed-pdf' : 'plain-link';
+        a.append(...sanitizeChildren(child));
+        out.push(a);
+      } else {
+        out.push(...sanitizeChildren(child)); // 不正なhrefはリンクを剥がして中身だけ
+      }
+      continue;
+    }
+    if (tag === 'IFRAME') {
+      const src = child.getAttribute('src') || '';
+      try {
+        const u = new URL(src);
+        if (u.protocol === 'https:' && ALLOWED_IFRAME_HOSTS.includes(u.hostname)) {
+          const f = document.createElement('iframe');
+          f.src = u.href;
+          const h = parseInt(child.getAttribute('height'), 10);
+          if (h > 0 && h <= 1000) f.height = h;
+          f.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
+          f.setAttribute('loading', 'lazy');
+          out.push(f);
+        }
+      } catch (err) { /* 不正なURLは捨てる */ }
+      continue;
+    }
+    if (tag === 'DIV') {
+      const div = document.createElement('div');
+      if (/\bembed-podcast\b/.test(child.className)) div.className = 'embed-podcast';
+      div.append(...sanitizeChildren(child));
+      out.push(div);
+      continue;
+    }
+    // その他のタグ(ペースト由来のb/span等): タグを剥がして中身だけ残す
+    out.push(...sanitizeChildren(child));
+  }
+  return out;
+}
+
+// following: 執筆点(最下部)に追従しているか。初回表示で執筆点に着地させ、
+// 読者が上へスクロールしたら追従を止めてチップを出す。
+let following = true;
+let receivedFirst = false;
+
+// mode: 'live' | 'away' | null(インジケータなしのプレーンテキスト)
+function setStatus(text, mode) {
+  if (mode) {
+    statusEl.innerHTML = '<span class="dot"></span>' + text;
+  } else {
+    statusEl.textContent = text;
+  }
+  statusEl.classList.toggle('live', mode === 'live');
+  setAway(mode === 'away');
+}
+
+// 不在表示をまとめて切り替える: ステータス・チップの■化、キャレット非表示、チップの文言
+function setAway(away) {
+  document.body.classList.toggle('away', away);
+  jumpLabel.textContent = away ? 'Away from Screen ▼' : 'いま書いています ▼';
+}
+
+function isNearBottom() {
+  return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 120;
+}
+
+function scrollToLatest() {
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+wrap.addEventListener('scroll', () => {
+  if (isNearBottom()) {
+    following = true;
+    jumpChip.classList.remove('visible');
+  } else {
+    following = false;
+    jumpChip.classList.add('visible');
+  }
+});
+
+jumpChip.addEventListener('click', () => {
+  scrollToLatest();
+  following = true;
+  jumpChip.classList.remove('visible');
+});
+
+function connect() {
+  // ローカルはhttp/ws、クラウド中継(Fly等)はhttps/wssになる
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/sub`);
+
+  // openでは何もしない: 接続直後にサーバーが在席状態(presence)を送ってくるので、
+  // LIVE/Away from Screenの表示はそちらに任せる
+
+  ws.addEventListener('message', (e) => {
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch (err) {
+      return;
+    }
+    if (msg.presence) {
+      // 書き手の在席状態の通知(スナップショットではない)
+      if (msg.presence === 'live') {
+        setStatus('LIVE', 'live');
+      } else {
+        setStatus('Away from Screen', 'away');
+      }
+      return;
+    }
+    if (msg.session !== lastSession) {
+      lastSession = msg.session;
+      lastSeq = 0;
+    }
+    if (msg.seq <= lastSeq) return;   // 順序が入れ替わった古いスナップショットは捨てる
+    lastSeq = msg.seq;
+
+    sanitizeInto(view, msg.html);
+    view.appendChild(caret);
+
+    if (!receivedFirst) {
+      // 初回: ゲストを「いま書かれている場所」に着地させる。
+      // 画像の遅延読み込みで高さが後から伸びても執筆点に留まるよう、
+      // 追従中に限り少し遅れてもう一度合わせる。
+      receivedFirst = true;
+      scrollToLatest();
+      setTimeout(() => { if (following) scrollToLatest(); }, 300);
+      setTimeout(() => { if (following) scrollToLatest(); }, 1200);
+    } else if (following) {
+      // 追従中: 執筆点に張り付き続ける(読み返し中は引き戻さない)
+      scrollToLatest();
+    } else {
+      // 読み返し中に新しい打鍵が来た: チップの●を脈打たせて知らせる
+      jumpChip.classList.remove('pulse');
+      void jumpChip.offsetWidth;  // アニメーションを再発火させるためのreflow
+      jumpChip.classList.add('pulse');
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    setStatus('切断 — 再接続中…');
+    // 切断中はライブの根拠がないので、不在表示に落としておく
+    setAway(true);
+    setTimeout(connect, 2000);
+  });
+  ws.addEventListener('error', () => {
+    try { ws.close(); } catch (err) {}
+  });
+}
+
+connect();
+</script>
+</body>
+</html>

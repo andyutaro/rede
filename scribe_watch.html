@@ -215,10 +215,16 @@ const ALLOWED_IFRAME_HOSTS = [
   'www.youtube.com',
 ];
 
-function sanitizeInto(target, html) {
+function sanitizeNodes(html) {
   // DOMParserの生成するドキュメントは不活性(スクリプト実行・リソース読込なし)
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  target.replaceChildren(...sanitizeChildren(doc.body));
+  return sanitizeChildren(doc.body);
+}
+
+// deskが焼き込むブロックIDは差分適用のキーとして引き継ぐ(値は形式検証する)
+function copyBlockId(from, to) {
+  const bid = from.getAttribute && from.getAttribute('data-block-id');
+  if (bid && /^[A-Za-z0-9_-]{1,64}$/.test(bid)) to.setAttribute('data-block-id', bid);
 }
 
 function sanitizeChildren(node) {
@@ -243,6 +249,7 @@ function sanitizeChildren(node) {
         const img = document.createElement('img');
         img.src = src;
         img.className = 'embed-image';
+        copyBlockId(child, img);
         out.push(img);
       }
       continue;
@@ -256,6 +263,7 @@ function sanitizeChildren(node) {
         v.playsInline = true;
         v.preload = 'metadata';
         v.className = 'embed-video';
+        copyBlockId(child, v);
         out.push(v);
       }
       continue;
@@ -268,6 +276,7 @@ function sanitizeChildren(node) {
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
         a.className = /\bembed-pdf\b/.test(child.className) ? 'embed-pdf' : 'plain-link';
+        copyBlockId(child, a);
         a.append(...sanitizeChildren(child));
         out.push(a);
       } else {
@@ -286,6 +295,7 @@ function sanitizeChildren(node) {
           if (h > 0 && h <= 1000) f.height = h;
           f.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture');
           f.setAttribute('loading', 'lazy');
+          copyBlockId(child, f);
           out.push(f);
         }
       } catch (err) { /* 不正なURLは捨てる */ }
@@ -294,6 +304,7 @@ function sanitizeChildren(node) {
     if (tag === 'DIV') {
       const div = document.createElement('div');
       if (/\bembed-podcast\b/.test(child.className)) div.className = 'embed-podcast';
+      copyBlockId(child, div);
       div.append(...sanitizeChildren(child));
       out.push(div);
       continue;
@@ -302,6 +313,70 @@ function sanitizeChildren(node) {
     out.push(...sanitizeChildren(child));
   }
   return out;
+}
+
+// ---- 差分適用 ----
+// 全量スナップショットをそのままreplaceChildrenすると、打鍵のたびに<video>が
+// 読み込み直しで点滅し、Spotify等のiframeもリセットされる。そこでブロックID
+// (data-block-id)をキーに差分だけをDOMに適用し、変わっていないノードには
+// 一切触れない(動画・埋め込みは打鍵中も再生が途切れない)。
+function nodeKey(node) {
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const id = node.getAttribute('data-block-id');
+    if (id) return node.tagName + '#' + id;
+  }
+  return null;
+}
+
+function sameNode(a, b) {
+  if (a.nodeType !== b.nodeType) return false;
+  if (a.nodeType === Node.TEXT_NODE) return a.textContent === b.textContent;
+  if (a.nodeType === Node.ELEMENT_NODE) return a.outerHTML === b.outerHTML;
+  return false;
+}
+
+function patchView(newNodes) {
+  caret.remove();
+  let cur = view.firstChild;
+  for (const next of newNodes) {
+    // 変わっていない -> 触らない
+    if (cur && sameNode(cur, next)) {
+      cur = cur.nextSibling;
+      continue;
+    }
+    const key = nodeKey(next);
+    if (key) {
+      // 同じキーのノードが後方にあれば、間の古いノードを削除して追いつく
+      // (ブロック削除時に後続の動画等を作り直さないため)
+      let scan = cur;
+      while (scan && nodeKey(scan) !== key) scan = scan.nextSibling;
+      if (scan) {
+        while (cur !== scan) {
+          const n = cur.nextSibling;
+          cur.remove();
+          cur = n;
+        }
+        if (sameNode(cur, next)) {
+          cur = cur.nextSibling;
+          continue;
+        }
+        // 同じブロックの中身が変わった -> その場で置換
+        const after = cur.nextSibling;
+        view.replaceChild(next, cur);
+        cur = after;
+        continue;
+      }
+    }
+    // 新規ノード -> 現在位置に挿入
+    view.insertBefore(next, cur);
+  }
+  // 余った古いノードを削除
+  while (cur) {
+    const n = cur.nextSibling;
+    cur.remove();
+    cur = n;
+  }
+  view.appendChild(caret);
 }
 
 // following: 執筆点(最下部)に追従しているか。初回表示で執筆点に着地させ、
@@ -381,8 +456,7 @@ function connect() {
     if (msg.seq <= lastSeq) return;   // 順序が入れ替わった古いスナップショットは捨てる
     lastSeq = msg.seq;
 
-    sanitizeInto(view, msg.html);
-    view.appendChild(caret);
+    patchView(sanitizeNodes(msg.html));
 
     if (!receivedFirst) {
       // 初回: ゲストを「いま書かれている場所」に着地させる。

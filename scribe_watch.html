@@ -116,6 +116,12 @@
     border: none;
     width: 100%;
   }
+  .embed-video {
+    display: block;
+    max-width: 100%;
+    border-radius: 6px;
+    margin: 14px 0;
+  }
   a.plain-link {
     color: #7fb0e0;
     text-decoration: underline;
@@ -237,6 +243,19 @@ function sanitizeChildren(node) {
         img.src = src;
         img.className = 'embed-image';
         out.push(img);
+      }
+      continue;
+    }
+    if (tag === 'VIDEO') {
+      const src = child.getAttribute('src') || '';
+      if (/^https:\/\//i.test(src)) {
+        const v = document.createElement('video');
+        v.src = src;
+        v.controls = true;
+        v.playsInline = true;
+        v.preload = 'metadata';
+        v.className = 'embed-video';
+        out.push(v);
       }
       continue;
     }

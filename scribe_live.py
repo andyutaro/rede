@@ -20,6 +20,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import struct
 import threading
 from urllib.parse import urlparse, parse_qs
@@ -29,6 +30,14 @@ _WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 # 1フレームの上限。全量スナップショット方式でも1日分は数百KBに収まる想定で、
 # 公開時にpubを装った巨大フレームでメモリを食い潰されるのを防ぐ。
 _MAX_FRAME = 4 * 1024 * 1024
+
+# 接続数の上限(2026-10-28)。**無制限だと第三者が繋ぎ続けるだけで無料枠のVMが詰まり、
+# ライブ配信が止まる。** 想定は個人の番組で同時数人なので、50でも桁違いの余裕がある。
+# 書き手は本人だけだが、タブや端末の重複を見込んで4。環境変数で上げ下げできる。
+_MAX_SUBS = int(os.environ.get('SCRIBE_MAX_SUBS', '50'))
+_MAX_PUBS = int(os.environ.get('SCRIBE_MAX_PUBS', '4'))
+# 認証フレームを送ってこない接続を居座らせない
+_AUTH_TIMEOUT = 10
 
 _subs = set()          # 閲覧者の生ソケット
 _last_frame = None     # 最後に配信した送信用フレーム(途中参加の閲覧者へ即送るため)
@@ -44,9 +53,26 @@ def set_pub_token(token):
 
 
 def _pub_authorized(handler):
+    """旧方式: ?token= で渡す。**URLはプロキシやログに残る**ので新規はこれを使わない。
+    切り替えの谷間で放送が止まらないよう当面は受ける(書き手側の移行を確認したら消す)。"""
     qs = parse_qs(urlparse(handler.path).query)
     supplied = (qs.get('token') or [''])[0]
     return bool(_pub_token) and hmac.compare_digest(supplied, _pub_token)
+
+
+def _first_message_authorized(msg):
+    """新方式(2026-10-28): 接続直後の最初のテキストフレーム {"auth": "..."} で渡す。
+    ブラウザはWebSocketに独自ヘッダを付けられないため、URLに載せない方法はこれになる。
+    **このフレームは放送しない。**"""
+    try:
+        data = json.loads(msg.decode('utf-8'))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    supplied = data.get('auth')
+    return (bool(_pub_token) and isinstance(supplied, str)
+            and hmac.compare_digest(supplied, _pub_token))
 
 
 # ---- ハンドシェイク ----
@@ -170,23 +196,39 @@ def _presence_frame():
 
 def handle_pub(handler):
     """書き手の接続。受信したテキストフレームを閲覧者へ中継し続ける。
-    接続・切断のたびに在席状態(presence)を全閲覧者へ通知する。
-    共有シークレットトークン(?token=)を持つ接続だけを受け付ける。"""
+    認証は**接続直後の最初のフレーム**({"auth": "..."})で行う(2026-10-28)。
+    旧来の ?token= も当面は受ける。認証できるまでは在席にも数えず、放送もしない。"""
     global _pubs
-    if not _pub_authorized(handler):
-        handler.send_error(401, 'pub token required')
-        return
+    authed = _pub_authorized(handler)      # 旧方式。移行が済んだら消す
+    with _lock:
+        if _pubs >= _MAX_PUBS:
+            handler.send_error(503, 'too many writers')
+            return
     if not _handshake(handler):
         return
     conn = handler.connection
     rfile = handler.rfile
-    with _lock:
-        _pubs += 1
-    _fanout(_presence_frame())
+    counted = False
+
+    def _count_in():
+        nonlocal counted
+        global _pubs
+        with _lock:
+            _pubs += 1
+        counted = True
+        _fanout(_presence_frame())
+
     try:
+        if authed:
+            _count_in()
         fragments = b''
         while True:
+            if not authed:
+                # 認証フレームを送らない接続を居座らせない
+                conn.settimeout(_AUTH_TIMEOUT)
             frame = _read_frame(rfile)
+            if not authed:
+                conn.settimeout(None)
             if frame is None:
                 return
             fin, opcode, payload = frame
@@ -200,17 +242,33 @@ def handle_pub(handler):
                 continue
             if opcode in (0x0, 0x1, 0x2):   # continuation / text / binary
                 fragments += payload
-                if fin:
-                    broadcast(fragments)
-                    fragments = b''
+                if not fin:
+                    continue
+                msg, fragments = fragments, b''
+                if not authed:
+                    if not _first_message_authorized(msg):
+                        return          # 認証できなければ黙って閉じる
+                    authed = True
+                    _count_in()
+                    continue            # **認証フレームは放送しない**
+                broadcast(msg)
+    except OSError:
+        # settimeoutによる時間切れもここに来る(Python 3.10以降 socket.timeout は OSError)
+        return
     finally:
-        with _lock:
-            _pubs -= 1
-        _fanout(_presence_frame())
+        if counted:
+            with _lock:
+                _pubs -= 1
+            _fanout(_presence_frame())
 
 
 def handle_sub(handler):
-    """閲覧者の接続。登録して送りっぱなしにする。受信データは破棄する。"""
+    """閲覧者の接続。登録して送りっぱなしにする。受信データは破棄する。
+    **接続数に上限を置く**(2026-10-28)。無制限だと繋ぎ続けるだけで無料枠のVMが詰まる。"""
+    with _lock:
+        if len(_subs) >= _MAX_SUBS:
+            handler.send_error(503, 'too many viewers')
+            return
     if not _handshake(handler):
         return
     conn = handler.connection
